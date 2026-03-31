@@ -168,14 +168,7 @@ Ensure firewall rules allow inbound UDP on the chosen port.
 - `Documentation_main_c.tex` / PDF: embedded architecture and `main.c` deep dive
 - `Documentation_pc_analyzer_fft.tex` / PDF: DSP chain from acquisition to final speed estimate, with theory and formulas
 
-## Suggested GitHub repository title
 
-**`doppler-radar-stm32f767-end-to-end`**
-
-Alternative:
-
-- `stm32f767-doppler-radar-analyzer-suite`
-- `cw-radar-doppler-signal-chain-stm32-pc`
 
 ### Topics (suggestion)
 
