@@ -1,0 +1,57 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+*.swo
+
+# Python artifacts
+__pycache__\
+*.pyc
+
+# STM32CubeIDE / Eclipse generated
+Debug\
+Release\
+build\
+*.launch
+
+# C/C++ build outputs
+*.o
+*.obj
+*.d
+*.a
+*.lib
+*.dll
+*.exe
+*.exp
+*.pdb
+*.idb
+
+# CMake
+**\build\
+**\CMakeFiles\
+**\CMakeCache.txt
+**\cmake_install.cmake
+**\compile_commands.json
+**\Makefile
+**\_deps\
+
+# Local runtime files
+*.ini
+
+# LaTeX temporary files
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+
+# Keep published technical docs and source
+!Documentation_main_c.tex
+!Documentation_main_c.pdf
+!Documentation_pc_analyzer_fft.tex
+!Documentation_pc_analyzer_fft.pdf
+
+# External reference documents (copyright-sensitive)
+FRSPMR.pdf
+FRSPMR_extracted.txt

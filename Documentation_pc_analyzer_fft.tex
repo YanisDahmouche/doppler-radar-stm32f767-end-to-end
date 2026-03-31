@@ -1,0 +1,625 @@
+\documentclass[a4paper,11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[french]{babel}
+\usepackage{geometry}
+\geometry{margin=2.2cm}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\definecolor{codebg}{HTML}{F5F7FA}
+\definecolor{codeborder}{HTML}{C5D0DC}
+\definecolor{codecomment}{HTML}{2E8B57}
+\definecolor{codekeyword}{HTML}{0000FF}
+\definecolor{codestring}{HTML}{A31515}
+
+\lstdefinestyle{cstyle}{
+  language=C++,
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{codekeyword}\bfseries,
+  commentstyle=\color{codecomment}\itshape,
+  stringstyle=\color{codestring},
+  frame=single,
+  rulecolor=\color{codeborder},
+  breaklines=true,
+  showstringspaces=false
+}
+
+\title{Analyse FFT et traitement du signal\\dans \texttt{pc\_analyzer}}
+\author{Projet Radar Doppler 24.125 GHz}
+\date{Mars 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Objectif de ce document}
+
+Ce document explique, en profondeur, la cha\^ine de traitement du signal du programme \texttt{pc\_analyzer} (\texttt{radar\_analyzer.cpp}), depuis l'acquisition ADC c\^ot\'e STM32 jusqu'au r\'esultat final affich\'e \`a l'op\'erateur (fr\'equence Doppler, vitesse, SNR, spectre, spectrogramme, tendance).
+
+L'objectif est double :
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Technique} : comprendre exactement ce que fait le code.
+  \item \textbf{Th\'eorique} : relier chaque choix d'impl\'ementation aux principes DSP/radar.
+\end{itemize}
+
+\section{Vue syst\`eme: de l'onde radar \`a la vitesse affich\'ee}
+
+\subsection{Cha\^ine fonctionnelle}
+
+\[
+\text{Cible en mouvement}
+\rightarrow
+\text{D\'ecalage Doppler } f_d
+\rightarrow
+\text{Signal IF analogique}
+\rightarrow
+\text{ADC STM32 (100 kHz)}
+\rightarrow
+\text{Hops UDP}
+\rightarrow
+\text{Fen\^etre glissante PC}
+\rightarrow
+\text{FFT + d\'etection}
+\rightarrow
+\text{Estimation vitesse}
+\rightarrow
+\text{Affichage temps r\'eel}
+\]
+
+\subsection{Relation Doppler utilis\'ee}
+
+Le code utilise le facteur :
+\[
+f_d \approx 161 \cdot v \quad (\text{Hz pour } v \text{ en m/s})
+\]
+soit :
+\[
+v = \frac{f_d}{161}
+\]
+
+Ce facteur provient de la formule monostatique :
+\[
+f_d = \frac{2 v f_0}{c}
+\]
+avec \(f_0 = 24.125\,\text{GHz}\).
+
+\section{Param\`etres fondamentaux de \texttt{pc\_analyzer}}
+
+Le code fixe les constantes de base suivantes :
+\begin{lstlisting}[style=cstyle]
+FS = 100000.0f
+STM32_FRAME_SIZE = 4096
+STM32_HOP_SIZE = 1024
+UDP_PORT = 5555
+DOPPLER_SCALE = 161.0f
+\end{lstlisting}
+
+Interpr\'etation physique :
+\begin{itemize}[leftmargin=2em]
+  \item Un hop de 1024 \'echantillons couvre \(1024/100000 = 10.24\) ms.
+  \item Une fen\^etre de 4096 couvre \(40.96\) ms.
+  \item Le moteur FFT PC est configurable (\(1024 \rightarrow 65536\) points), avec valeur par d\'efaut 8192.
+\end{itemize}
+
+\section{Transport UDP et reconstruction du signal}
+
+\subsection{Fragmentation c\^ot\'e r\'eseau}
+
+Chaque hop ADC (1024 \(\times\) uint16 = 2048 octets) est fragment\'e. C\^ot\'e PC, le thread UDP d\'ecode un en-t\^ete de 12 octets :
+\begin{itemize}[leftmargin=2em]
+  \item \texttt{seq} : num\'ero de s\'equence hop,
+  \item \texttt{frag\_id}, \texttt{frag\_count},
+  \item \texttt{offset}, \texttt{payload\_len}.
+\end{itemize}
+
+Le r\'eassemblage utilise un bitmap de fragments pour :
+\begin{itemize}[leftmargin=2em]
+  \item accepter les arriv\'ees hors ordre,
+  \item ignorer les doublons,
+  \item d\'etecter les hops incomplets/perdus.
+\end{itemize}
+
+\subsection{Fen\^etre glissante locale}
+
+Une fois un hop complet re\c{c}u :
+\begin{enumerate}[leftmargin=2em]
+  \item on d\'ecale \texttt{rolling\_adc} de 1024 \'echantillons (\texttt{memmove}),
+  \item on ins\`ere le nouveau hop en fin de fen\^etre.
+\end{enumerate}
+
+Cette op\'eration cr\'ee une analyse \textbf{overlap 75\%} :
+\[
+\text{pas temporel} = 1024, \quad \text{taille fen\^etre} = 4096
+\]
+ce qui am\'eliore la r\'eactivit\'e d'affichage sans sacrifier la stabilit\'e fr\'equentielle.
+
+\section{Pr\'e-traitement temporel avant FFT}
+
+\subsection{Notations et cadre math\'ematique}
+
+Dans cette section, nous notons :
+\begin{itemize}[leftmargin=2em]
+  \item \(x[n]\) : \'echantillon ADC brut (apr\`es reconstruction de fen\^etre glissante),
+  \item \(N_w = 4096\) : longueur physique de la fen\^etre glissante trait\'ee,
+  \item \(N_{FFT}\) : taille de FFT demand\'ee (\(N_{FFT}\ge N_w\), puissance de 2),
+  \item \(F_s = 100\,000\) Hz : fr\'equence d'\'echantillonnage.
+\end{itemize}
+
+\subsection{Suppression de la composante continue (DC removal)}
+
+Le code estime la moyenne temporelle puis centre le signal :
+\[
+\mu = \frac{1}{N_w}\sum_{n=0}^{N_w-1}x[n],
+\qquad
+x_c[n]=x[n]-\mu.
+\]
+
+\paragraph{Pourquoi c'est crucial.}
+Sans cette \'etape, la composante quasi-statique de l'ADC (offset analogique + offset num\'erique) concentre une \'energie importante autour du bin \(k=0\). Via fuite spectrale, cette \'energie se propage dans les bins voisins et r\'eduit fortement la sensibilit\'e de d\'etection aux faibles Doppler.
+
+\paragraph{Lecture physique.}
+On ne cherche pas l'\'energie absolue du front-end, mais la \emph{modulation Doppler}. Le centrage transforme donc le probl\`eme en ``analyser des variations autour d'un point d'\'equilibre''.
+
+\subsection{Fen\^etre de Hann : forme, r\^ole, et compromis}
+
+Le fen\^etrage est :
+\[
+w[n] = \frac{1}{2}\left(1-\cos\left(\frac{2\pi n}{N_w-1}\right)\right), \quad 0\le n < N_w
+\]
+et
+\[
+x_w[n]=x_c[n]\,w[n].
+\]
+
+\paragraph{Composants de la formule.}
+\begin{itemize}[leftmargin=2em]
+  \item Le terme \(\cos(\cdot)\) impose une transition douce aux extr\'emit\'es.
+  \item Le facteur \(1/2\) normalise la plage vers \([0,1]\).
+  \item La division par \(N_w-1\) aligne exactement les bords \(n=0\) et \(n=N_w-1\) \`a z\'ero.
+\end{itemize}
+
+\paragraph{Pourquoi fen\^etrer en radar Doppler.}
+La FFT suppose implicitement un signal p\'eriodique sur la fen\^etre analys\'ee. Sans fen\^etre, la couture entre fin et d\'ebut cr\'ee une discontinuit\'e, ce qui \'etale l'\'energie d'une raie dans de nombreux bins (\emph{spectral leakage}). La Hann r\'eduit drastiquement les lobes secondaires, au prix d'un lobe principal plus large.
+
+\paragraph{Point d'impl\'ementation important.}
+Le code calcule \(w[n]\) sur \(N_w=4096\), m\^eme si \(N_{FFT}>4096\). C'est correct : la fen\^etre doit \'epouser la portion effectivement observ\'ee du signal, puis le padding intervient \emph{apr\`es}.
+
+\subsection{Zero-padding : ce que c'est, et ce que ce n'est pas}
+
+Si \(N_{FFT}>N_w\), le code applique :
+\[
+x_p[n]=
+\begin{cases}
+x_w[n], & 0\le n < N_w\\
+0, & N_w \le n < N_{FFT}.
+\end{cases}
+\]
+
+\paragraph{Interpr\'etation rigoureuse.}
+Le zero-padding n'augmente pas l'information (pas de nouvelle mesure), mais augmente la densit\'e d'\'echantillonnage de la transform\'ee discr\`ete en fr\'equence. En pratique, cela facilite la lecture du pic, l'affichage, et la stabilit\'e des m\'ethodes de d\'etection bas\'ees sur le ``maximum de bin''.
+
+\subsection{Exemple num\'erique (section 5)}
+
+Prenons un bloc de 4096 \'echantillons ADC avec :
+\[
+\mu = 2042.7 \text{ LSB},\quad x[1000]=2190 \text{ LSB}.
+\]
+Apr\`es centrage :
+\[
+x_c[1000]=2190-2042.7=147.3 \text{ LSB}.
+\]
+
+Supposons \(w[1000]=0.31\) (Hann). Alors :
+\[
+x_w[1000]=147.3\times 0.31 \approx 45.7 \text{ LSB}.
+\]
+
+Si \(N_{FFT}=8192\), les 4096 \'echantillons suivants sont z\'ero :
+\[
+x_p[4096]=x_p[4097]=\cdots=x_p[8191]=0.
+\]
+On a donc la m\^eme information physique que sur 4096 points, mais un maillage spectral plus fin.
+
+\section{FFT, magnitude et \'echelle en dB}
+
+\subsection{Transform\'ee discr\`ete en fr\'equence}
+
+Le moteur \texttt{kissfft::rfft} calcule :
+\[
+X[k]=\sum_{n=0}^{N_{FFT}-1}x_p[n]e^{-j2\pi kn/N_{FFT}},\quad 0\le k < N_{FFT}.
+\]
+Comme le signal est r\'eel, le spectre est conjugu\'e-sym\'etrique, et l'on exploite la moiti\'e positive (\(0\) \`a \(N_{FFT}/2\)).
+
+\subsection{Correspondance bin \(\leftrightarrow\) fr\'equence}
+
+Chaque bin \(k\) repr\'esente :
+\[
+f_k = k\frac{F_s}{N_{FFT}},\qquad \Delta f = \frac{F_s}{N_{FFT}}.
+\]
+
+\paragraph{Exemple.}
+Pour \(F_s=100\,\text{kHz}\), \(N_{FFT}=8192\) :
+\[
+\Delta f \approx 12.207\,\text{Hz/bin}.
+\]
+
+\subsection{Module complexe et passage en dB}
+
+Le code calcule :
+\[
+|X[k]| = \sqrt{\Re(X[k])^2+\Im(X[k])^2},
+\]
+puis
+\[
+S[k]_{\mathrm{dB}} = 20\log_{10}\!\big(|X[k]|+\varepsilon\big),\quad \varepsilon=10^{-12}.
+\]
+
+\paragraph{Pourquoi \(20\log_{10}\) et pas \(10\log_{10}\).}
+\(S[k]\) est un \emph{module d'amplitude}. Pour une grandeur de puissance, on utiliserait \(10\log_{10}\). Ici on convertit une amplitude, d'o\`u le facteur 20.
+
+\paragraph{R\^ole de \(\varepsilon\).}
+Il garantit la d\'efinition num\'erique du logarithme m\^eme si \(|X[k]|\approx 0\), sans alt\'erer la dynamique utile.
+
+\subsection{Lissage exponentiel bin par bin}
+
+Le spectre liss\'e suit :
+\[
+S_s^{(m)}[k]=(1-\alpha)S_s^{(m-1)}[k]+\alpha S^{(m)}[k],
+\]
+o\`u \(m\) est l'indice temporel de hop trait\'e.
+
+\paragraph{Constante de temps effective.}
+Avec un pas temporel \(T_h=10.24\) ms (hop de 1024), une approximation de la constante de temps est :
+\[
+\tau \approx \frac{T_h}{\alpha}.
+\]
+Donc \(\alpha\) petit donne un spectre tr\`es stable (mais moins r\'eactif).
+
+\subsection{Exemple num\'erique (section 6)}
+
+Consid\'erons \(F_s=100000\) Hz.
+
+\paragraph{Cas A : \(N_{FFT}=8192\).}
+\[
+\Delta f = \frac{100000}{8192}=12.207\ \text{Hz/bin}.
+\]
+Un pic au bin \(k=410\) correspond \`a :
+\[
+f_{410}=410\times 12.207 \approx 5005\ \text{Hz}.
+\]
+
+\paragraph{Conversion dB.}
+Si \(|X[410]|=2500\), alors :
+\[
+S[410]_{dB}=20\log_{10}(2500)\approx 67.96\ \text{dB}.
+\]
+Si le frame pr\'ec\'edent avait \(S_s^{(m-1)}[410]=64\) dB et \(\alpha=0.25\) :
+\[
+S_s^{(m)}[410]=0.75\times64+0.25\times67.96
+=64.99\ \text{dB}.
+\]
+On voit la stabilisation : le saut brut de \(+3.96\) dB devient \(+0.99\) dB.
+
+\section{D\'etection CFAR et robustification bruit}
+
+\subsection{CA-CFAR : d\'etail de la construction du seuil}
+
+Pour une cellule test \(k\) (\emph{CUT}), on d\'efinit :
+\begin{itemize}[leftmargin=2em]
+  \item \(G\) cellules de garde de chaque c\^ot\'e (pour exclure l'\'energie du pic),
+  \item \(R\) cellules de r\'ef\'erence de chaque c\^ot\'e (estimation bruit local).
+\end{itemize}
+
+Le nombre de cellules de r\'ef\'erence effectives vaut \(N_{ref}\approx 2R\) (hors bords).
+
+Le bruit local estim\'e en dB :
+\[
+\widehat{N}[k]=\frac{1}{N_{ref}}
+\left(\sum_{i\in\mathcal{L}_k}S_s[i]+\sum_{i\in\mathcal{R}_k}S_s[i]\right),
+\]
+avec \(\mathcal{L}_k,\mathcal{R}_k\) les ensembles de r\'ef\'erence gauche/droite.
+
+Le seuil :
+\[
+T[k]=\widehat{N}[k]+\alpha_{CFAR},
+\]
+et la d\'etection binaire :
+\[
+D[k]=
+\begin{cases}
+1,& S_s[k]>T[k]\\
+0,& \text{sinon}.
+\end{cases}
+\]
+
+\paragraph{Sens de \(\alpha_{CFAR}\).}
+\(\alpha_{CFAR}\) est une marge en dB au-dessus du bruit local. Plus \(\alpha\) augmente, plus la probabilit\'e de fausse alarme baisse, mais plus la probabilit\'e de d\'etection des cibles faibles diminue.
+
+\subsection{Traitement des perturbations secteur et harmoniques}
+
+Le code inclut un masque ``mains'' : bins proches de \(h f_{mains}\) (\(h=1..H\)) sont p\'enalis\'es/invalid\'es.
+
+Math\'ematiquement, pour un bin \(k\), si
+\[
+|f_k-hf_{mains}|\le W_{mains},
+\]
+alors \(D[k]\leftarrow 0\) et \(T[k]\) est major\'e d'une marge suppl\'ementaire.
+
+Interpr\'etation : on injecte une connaissance \emph{a priori} sur une source d'interf\'erence quasi-d\'eterministe.
+
+\subsection{Notch param\'etrique}
+
+Si activ\'e, un notch logiciel att\'enue les bins de la bande :
+\[
+\mathcal{B}_{notch}=\left[f_c-\frac{B}{2},\;f_c+\frac{B}{2}\right]
+\]
+avec profondeur \(D_{notch}\) (en dB). Concr\`etement, le code soustrait \(D_{notch}\) \`a \(S[k]\) et \(S_s[k]\) dans cette bande.
+
+\subsection{Plancher de bruit adaptatif : mod\`ele dynamique}
+
+Le bruit instantan\'e \(N_{inst}\) est la m\'ediane des bins non d\'etect\'es et non notched. Puis :
+\[
+N_f^{(m+1)}=
+\begin{cases}
+N_f^{(m)}+\alpha_{\uparrow}(N_{inst}^{(m)}-N_f^{(m)}), & N_{inst}^{(m)}>N_f^{(m)}\\
+N_f^{(m)}+\alpha_{\downarrow}(N_{inst}^{(m)}-N_f^{(m)}), & N_{inst}^{(m)}\le N_f^{(m)}.
+\end{cases}
+\]
+
+Ensuite on force :
+\[
+T[k]\ge N_f+\Delta_{offset}.
+\]
+
+\paragraph{Lecture ``syst\`eme''.}
+\(\alpha_{\uparrow}\) rapide permet de suivre une hausse soudaine du bruit; \(\alpha_{\downarrow}\) plus lent \'evite de ``d\'ecrocher'' trop vite apr\`es un transitoire. C'est un m\'ecanisme d'hyst\'er\'esis temporelle sur le plancher.
+
+\subsection{Exemple num\'erique (section 7)}
+
+Prenons :
+\[
+G=4,\quad R=16,\quad \alpha_{CFAR}=12\ \text{dB}.
+\]
+Donc \(N_{ref}\approx 32\) cellules.
+
+Pour un CUT \(k\), supposons :
+\[
+\widehat{N}[k]=-58.5\ \text{dB}.
+\]
+Le seuil devient :
+\[
+T[k]=-58.5+12=-46.5\ \text{dB}.
+\]
+
+Si \(S_s[k]=-43.0\) dB :
+\[
+S_s[k]-T[k]=3.5\ \text{dB}>0\Rightarrow D[k]=1.
+\]
+
+Si un plancher adaptatif vaut \(N_f=-50\) dB avec \(\Delta_{offset}=8\) dB :
+\[
+N_f+\Delta_{offset}=-42\ \text{dB}.
+\]
+Le seuil effectif devient alors au moins \(-42\) dB (plus strict que \(-46.5\) dB), ce qui bloque certaines fausses alarmes en bruit montant.
+
+Enfin, exemple de mise \`a jour adaptative :
+\[
+N_f^{(m)}=-55,\quad N_{inst}^{(m)}=-49,\quad \alpha_{\uparrow}=0.2
+\]
+\[
+N_f^{(m+1)}=-55+0.2\times 6 = -53.8\ \text{dB}.
+\]
+
+\section{Extraction de la cible et estimation cin\'ematique}
+
+\subsection{Du masque binaire au pic cible}
+
+Parmi les bins avec \(D[k]=1\), le code retient :
+\[
+k^\star = \arg\max_{k: D[k]=1} S_s[k].
+\]
+Puis il applique un filtre m\'edian sur l'historique des indices :
+\[
+\tilde{k}^{(m)}=\mathrm{median}\!\left(k^\star_{m-L+1},\dots,k^\star_m\right),
+\]
+(\(L=\)\texttt{peak\_median\_len}).
+
+Ce filtrage est tr\`es efficace contre les sauts impulsionnels d'un bin \`a l'autre.
+
+\subsection{Conversion fr\'equence \(\rightarrow\) vitesse}
+
+Une fois \(\tilde{k}\) obtenu :
+\[
+f_{peak}=\tilde{k}\frac{F_s}{N_{FFT}},
+\qquad
+v_{raw}=\frac{f_{peak}}{DOPPLER\_SCALE}.
+\]
+En km/h :
+\[
+v_{raw,km/h}=3.6\,v_{raw}.
+\]
+
+\subsection{SNR de la cible}
+
+Le SNR affich\'e est d\'efini (en dB) par :
+\[
+SNR_{peak}=S_s[\tilde{k}]-T[\tilde{k}].
+\]
+Ce n'est pas un SNR ``thermodynamique absolu'', mais un indicateur de \emph{distance au seuil adaptatif} : excellent pour le monitoring op\'erationnel.
+
+\subsection{Filtre de Kalman : d\'erivation des \'equations utilis\'ees}
+
+Le vecteur d'\'etat est :
+\[
+\mathbf{x}_m=
+\begin{bmatrix}
+v_m\\a_m
+\end{bmatrix},
+\quad
+\mathbf{F}=
+\begin{bmatrix}
+1&dt\\0&1
+\end{bmatrix},
+\quad
+\mathbf{H}=
+\begin{bmatrix}
+1&0
+\end{bmatrix}.
+\]
+
+Le mod\`ele de mesure est :
+\[
+z_m = \mathbf{H}\mathbf{x}_m + \nu_m,\qquad \nu_m\sim\mathcal{N}(0,R).
+\]
+
+La pr\'ediction :
+\[
+\hat{\mathbf{x}}^-_m = \mathbf{F}\hat{\mathbf{x}}_{m-1},
+\qquad
+\mathbf{P}^-_m = \mathbf{F}\mathbf{P}_{m-1}\mathbf{F}^T+\mathbf{Q}.
+\]
+
+Le code impl\'emente \(\mathbf{Q}\) du mod\`ele ``acc\'el\'eration blanche'' :
+\[
+\mathbf{Q}=q
+\begin{bmatrix}
+dt^4/4 & dt^3/2\\
+dt^3/2 & dt^2
+\end{bmatrix}.
+\]
+
+La correction :
+\[
+\mathbf{K}_m=\mathbf{P}^-_m\mathbf{H}^T(\mathbf{H}\mathbf{P}^-_m\mathbf{H}^T+R)^{-1},
+\]
+\[
+\hat{\mathbf{x}}_m=\hat{\mathbf{x}}^-_m+\mathbf{K}_m(z_m-\mathbf{H}\hat{\mathbf{x}}^-_m),
+\]
+\[
+\mathbf{P}_m=(\mathbf{I}-\mathbf{K}_m\mathbf{H})\mathbf{P}^-_m.
+\]
+
+\paragraph{Signification des param\`etres de r\'eglage.}
+\begin{itemize}[leftmargin=2em]
+  \item \(q\) (\texttt{kalman\_q\_accel}) : confiance dans le mod\`ele dynamique (grands changements possibles).
+  \item \(R\) (\texttt{kalman\_r\_meas}) : bruit suppos\'e de la mesure Doppler FFT.
+\end{itemize}
+
+\paragraph{Gestion des pertes de d\'etection.}
+Quand aucune mesure n'est disponible :
+\begin{itemize}[leftmargin=2em]
+  \item pas d'update, seulement pr\'ediction,
+  \item d\'ecroissance \(v\leftarrow \lambda v\) (\texttt{kalman\_miss\_decay}),
+  \item annulation sous seuil (\texttt{speed\_floor}),
+  \item reset complet apr\`es \texttt{kalman\_miss\_reset\_count}.
+\end{itemize}
+Ce bloc transforme un estimateur purement probabiliste en estimateur robuste op\'erationnel, adapt\'e \`a un capteur r\'eel sujet aux extinctions temporaires.
+
+\subsection{Exemple num\'erique (section 8)}
+
+\paragraph{1) Fr\'equence et vitesse.}
+Avec \(N_{FFT}=8192\), \(\Delta f=12.207\) Hz/bin.  
+Supposons \(\tilde{k}=132\) :
+\[
+f_{peak}=132\times 12.207 = 1611.3\ \text{Hz}.
+\]
+\[
+v_{raw}=\frac{1611.3}{161}=10.01\ \text{m/s}=36.0\ \text{km/h}.
+\]
+
+\paragraph{2) SNR au pic.}
+Si \(S_s[\tilde{k}]=-37.2\) dB et \(T[\tilde{k}]=-49.0\) dB :
+\[
+SNR_{peak}=11.8\ \text{dB}.
+\]
+
+\paragraph{3) Pas Kalman (illustratif).}
+Prenons \(dt=0.01024\) s, estimation pr\'edite \(v^- = 9.6\) m/s, mesure \(z=10.0\) m/s.
+Si le gain vitesse \(K_0=0.35\), alors :
+\[
+v = v^- + K_0(z-v^-)
+= 9.6 + 0.35(0.4)
+= 9.74\ \text{m/s}.
+\]
+Le filtre corrige partiellement vers la mesure, sans la suivre brutalement.
+
+\section{Publication des r\'esultats et rendu GUI}
+
+\subsection{Donn\'ees partag\'ees}
+
+Le thread DSP publie (mutex) :
+\begin{itemize}[leftmargin=2em]
+  \item ADC glissant brut,
+  \item spectre dB, seuil CFAR, masque d\'etections,
+  \item \(f_{peak}\), SNR, vitesse brute et Kalman,
+  \item plancher de bruit adaptatif,
+  \item spectrogramme circulaire,
+  \item FPS, \'etat connexion, pertes de trames.
+\end{itemize}
+
+\subsection{Sorties visuelles}
+
+Le GUI construit :
+\begin{itemize}[leftmargin=2em]
+  \item \textbf{Oscilloscope} (temps), avec fen\^etre temporelle ajustable,
+  \item \textbf{FFT + CFAR} (fr\'equence), avec curseur et marqueur pic,
+  \item \textbf{Spectrogramme waterfall} (temps-fr\'equence),
+  \item \textbf{Panneau num\'erique} (vitesse, SNR, statut cible),
+  \item \textbf{Trend Doppler} long terme.
+\end{itemize}
+
+Le spectrogramme est stock\'e en tampon circulaire 2D, texture OpenGL mise \`a jour en filtrage \texttt{NEAREST} pour une lecture nette des bins.
+
+\section{Lecture ``professeur'' : compromis et limites}
+
+\subsection{R\'esolution et latence}
+
+La r\'esolution fr\'equentielle vaut :
+\[
+\Delta f = \frac{F_s}{N_{FFT}}
+\]
+et la r\'esolution vitesse :
+\[
+\Delta v = \frac{\Delta f}{161}
+\]
+
+Augmenter \(N_{FFT}\) am\'eliore \(\Delta f\), mais augmente co\^ut de calcul et inertie d'estimation. Le hop \`a 10.24 ms maintient une cadence de rafra\^ichissement \'elev\'ee.
+
+\subsection{Ce que CFAR r\'esout, et ce qu'il ne r\'esout pas}
+
+CFAR traite bien l'h\'et\'erog\'en\'eit\'e du bruit local, mais :
+\begin{itemize}[leftmargin=2em]
+  \item il reste sensible \`a des interférences structur\'ees (secteur, parasites harmoniques),
+  \item il peut d\'egrader en multi-cibles tr\`es proches si les fen\^etres de garde/r\'ef\'erence sont mal r\'egl\'ees.
+\end{itemize}
+
+D'o\`u l'int\'er\^et des briques compl\'ementaires (notch, adaptive floor, median peak, Kalman).
+
+\subsection{Pourquoi vitesse brute + vitesse filtr\'ee}
+
+La vitesse brute montre le comportement instantan\'e physique; la vitesse Kalman fournit une estimation op\'erationnelle plus stable (pilotage UI, d\'ecision humaine).
+
+\section{Conclusion}
+
+\texttt{pc\_analyzer} r\'ealise une cha\^ine DSP radar compl\`ete et moderne :
+\begin{enumerate}[leftmargin=2em]
+  \item acquisition distribu\'ee (STM32 + UDP fragment\'e),
+  \item reconstruction glissante et pr\'e-traitements robustes,
+  \item analyse spectrale haute r\'esolution,
+  \item d\'etection adaptative (CFAR + bruit adaptatif + mains/notch),
+  \item estimation cin\'ematique stabilis\'ee (Kalman),
+  \item restitution visuelle et m\'etrologique temps r\'eel.
+\end{enumerate}
+
+Autrement dit, le logiciel n'est pas une simple FFT affich\'ee : c'est un estimateur radar complet, con\c{c}u pour transformer un flux ADC bruit\'e en information vitesse exploitable.
+
+\end{document}
+

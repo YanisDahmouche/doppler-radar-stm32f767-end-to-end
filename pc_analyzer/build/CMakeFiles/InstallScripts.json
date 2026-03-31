@@ -1,0 +1,9 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/yanis/STM32CubeIDE/workspace_1.19.0/projet_L3/projet_L3/pc_analyzer/build/cmake_install.cmake",
+		"C:/Users/yanis/STM32CubeIDE/workspace_1.19.0/projet_L3/projet_L3/pc_analyzer/build/_deps/glfw-build/cmake_install.cmake",
+		"C:/Users/yanis/STM32CubeIDE/workspace_1.19.0/projet_L3/projet_L3/pc_analyzer/build/_deps/glfw-build/src/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
