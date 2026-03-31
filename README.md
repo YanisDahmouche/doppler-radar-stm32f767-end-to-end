@@ -47,6 +47,12 @@ Processing chain:
 
 *Measured frequency response of the front-end signal conditioning path.*
 
+### Demo video
+
+[![Scope and analyzer demo](scope%20analyzer.png)](https://youtu.be/E4GLmaZWygU)
+
+*Click the image to watch the live scope/analyzer demonstration on YouTube.*
+
 ## Embedded firmware (STM32)
 
 Main firmware file: `Core\Src\main.c`
