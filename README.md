@@ -1,4 +1,5 @@
-# DopplerShield-F767: End-to-End 24.125 GHz Radar Signal Chain
+# Doppler radar using stm32 : End-to-End 24.125 GHz Radar Signal Chain
+
 
 An end-to-end Doppler radar project built around an **STM32F767ZI**, covering the full path from the **analog front-end** to **embedded acquisition/processing**, **OLED local feedback**, and two PC tools:
 
